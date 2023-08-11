@@ -125,11 +125,7 @@ endif()
 set(ZIG_PIE off CACHE BOOL "produce a position independent zig executable")
 
 # Detect system libcxx name.
-if ("c++" IN_LIST CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
-    set(ZIG_SYSTEM_LIBCXX "c++" CACHE STRING "system libcxx name for build.zig")
-else()
-    set(ZIG_SYSTEM_LIBCXX "stdc++" CACHE STRING "system libcxx name for build.zig")
-endif()
+set(ZIG_SYSTEM_LIBCXX "c++" CACHE STRING "system libcxx name for build.zig")
 
 find_package(llvm 17)
 find_package(clang 17)
