@@ -1154,14 +1154,10 @@ fn foobar(func: PFN_void) !void {
 }
 
 test "cast function with an opaque parameter" {
-<<<<<<< HEAD
-    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
-=======
     if (builtin.zig_backend == .stage2_c) {
         // https://github.com/ziglang/zig/issues/16845
         return error.SkipZigTest;
     }
->>>>>>> dad1b4cd4 (disable behavior tests regressed by LLVM 17)
 
     const Container = struct {
         const Ctx = opaque {};
