@@ -4899,7 +4899,7 @@ fn getZigShippedLibCIncludeDirsDarwin(arena: Allocator, zig_lib_dir: []const u8,
     };
 }
 
-fn detectLibCIncludeDirs(
+pub fn detectLibCIncludeDirs(
     arena: Allocator,
     zig_lib_dir: []const u8,
     target: Target,
