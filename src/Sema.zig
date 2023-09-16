@@ -131,7 +131,6 @@ const CompileError = Module.CompileError;
 const SemaError = Module.SemaError;
 const Decl = Module.Decl;
 const CaptureScope = Module.CaptureScope;
-const WipCaptureScope = Module.WipCaptureScope;
 const LazySrcLoc = Module.LazySrcLoc;
 const RangeSet = @import("RangeSet.zig");
 const target_util = @import("target.zig");
@@ -308,7 +307,7 @@ pub const Block = struct {
     /// used to add a `func_instance` into the `InternPool`.
     params: std.MultiArrayList(Param) = .{},
 
-    wip_capture_scope: *CaptureScope,
+    wip_capture_scope: CaptureScope.Index,
 
     label: ?*Label = null,
     inlining: ?*Inlining,
@@ -951,20 +950,11 @@ fn analyzeBodyInner(
     // different values for the same Zir.Inst.Index, so in those cases, we will
     // have to create nested capture scopes; see the `.repeat` case below.
     const parent_capture_scope = block.wip_capture_scope;
-    parent_capture_scope.incRef();
-    var wip_captures: WipCaptureScope = .{
-        .scope = parent_capture_scope,
-        .gpa = sema.gpa,
-        .finalized = true, // don't finalize the parent scope
-    };
-    defer wip_captures.deinit();
 
     const mod = sema.mod;
     const map = &sema.inst_map;
     const tags = sema.code.instructions.items(.tag);
     const datas = sema.code.instructions.items(.data);
-
-    var orig_captures: usize = parent_capture_scope.captures.count();
 
     var crash_info = crash_report.prepAnalyzeBody(sema, block, body);
     crash_info.push();
@@ -1028,6 +1018,7 @@ fn analyzeBodyInner(
             .elem_ptr_imm                 => try sema.zirElemPtrImm(block, inst),
             .elem_val                     => try sema.zirElemVal(block, inst),
             .elem_val_node                => try sema.zirElemValNode(block, inst),
+            .elem_val_imm                 => try sema.zirElemValImm(block, inst),
             .elem_type_index              => try sema.zirElemTypeIndex(block, inst),
             .elem_type                    => try sema.zirElemType(block, inst),
             .indexable_ptr_elem_type      => try sema.zirIndexablePtrElemType(block, inst),
@@ -1389,6 +1380,11 @@ fn analyzeBodyInner(
                 i += 1;
                 continue;
             },
+            .validate_destructure => {
+                try sema.zirValidateDestructure(block, inst);
+                i += 1;
+                continue;
+            },
             .@"export" => {
                 try sema.zirExport(block, inst);
                 i += 1;
@@ -1500,16 +1496,11 @@ fn analyzeBodyInner(
                     // Send comptime control flow back to the beginning of this block.
                     const src = LazySrcLoc.nodeOffset(datas[inst].node);
                     try sema.emitBackwardBranch(block, src);
-                    if (wip_captures.scope.captures.count() != orig_captures) {
-                        // We need to construct new capture scopes for the next loop iteration so it
-                        // can capture values without clobbering the earlier iteration's captures.
-                        // At first, we reused the parent capture scope as an optimization, but for
-                        // successive scopes we have to create new ones as children of the parent
-                        // scope.
-                        try wip_captures.reset(parent_capture_scope);
-                        block.wip_capture_scope = wip_captures.scope;
-                        orig_captures = 0;
-                    }
+
+                    // We need to construct new capture scopes for the next loop iteration so it
+                    // can capture values without clobbering the earlier iteration's captures.
+                    block.wip_capture_scope = try mod.createCaptureScope(parent_capture_scope);
+
                     i = 0;
                     continue;
                 } else {
@@ -1520,16 +1511,11 @@ fn analyzeBodyInner(
                 // Send comptime control flow back to the beginning of this block.
                 const src = LazySrcLoc.nodeOffset(datas[inst].node);
                 try sema.emitBackwardBranch(block, src);
-                if (wip_captures.scope.captures.count() != orig_captures) {
-                    // We need to construct new capture scopes for the next loop iteration so it
-                    // can capture values without clobbering the earlier iteration's captures.
-                    // At first, we reused the parent capture scope as an optimization, but for
-                    // successive scopes we have to create new ones as children of the parent
-                    // scope.
-                    try wip_captures.reset(parent_capture_scope);
-                    block.wip_capture_scope = wip_captures.scope;
-                    orig_captures = 0;
-                }
+
+                // We need to construct new capture scopes for the next loop iteration so it
+                // can capture values without clobbering the earlier iteration's captures.
+                block.wip_capture_scope = try mod.createCaptureScope(parent_capture_scope);
+
                 i = 0;
                 continue;
             },
@@ -1803,12 +1789,9 @@ fn analyzeBodyInner(
     }
     if (noreturn_inst) |some| try block.instructions.append(sema.gpa, some);
 
-    if (!wip_captures.finalized) {
-        // We've updated the capture scope due to a `repeat` instruction where
-        // the body had a capture; finalize our child scope and reset
-        try wip_captures.finalize();
-        block.wip_capture_scope = parent_capture_scope;
-    }
+    // We may have overwritten the capture scope due to a `repeat` instruction where
+    // the body had a capture; restore it now.
+    block.wip_capture_scope = parent_capture_scope;
 
     return result;
 }
@@ -3157,15 +3140,12 @@ fn zirEnumDecl(
         sema.func_index = .none;
         defer sema.func_index = prev_func_index;
 
-        var wip_captures = try WipCaptureScope.init(gpa, new_decl.src_scope);
-        defer wip_captures.deinit();
-
         var enum_block: Block = .{
             .parent = null,
             .sema = sema,
             .src_decl = new_decl_index,
             .namespace = new_namespace_index,
-            .wip_capture_scope = wip_captures.scope,
+            .wip_capture_scope = try mod.createCaptureScope(new_decl.src_scope),
             .instructions = .{},
             .inlining = null,
             .is_comptime = true,
@@ -3175,8 +3155,6 @@ fn zirEnumDecl(
         if (body.len != 0) {
             try sema.analyzeBody(&enum_block, body);
         }
-
-        try wip_captures.finalize();
 
         if (tag_type_ref != .none) {
             const ty = try sema.resolveType(block, tag_ty_src, tag_type_ref);
@@ -3806,6 +3784,21 @@ fn zirMakePtrConst(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErro
         var anon_decl = try block.startAnonDecl();
         defer anon_decl.deinit();
         return sema.analyzeDeclRef(try anon_decl.finish(elem_ty, store_val, ptr_info.flags.alignment));
+    }
+
+    // If this is already a comptime-mutable allocation, we don't want to emit an error - the stores
+    // were already performed at comptime! Just make the pointer constant as normal.
+    implicit_ct: {
+        const ptr_val = try sema.resolveMaybeUndefVal(alloc) orelse break :implicit_ct;
+        if (ptr_val.isComptimeMutablePtr(mod)) break :implicit_ct;
+        return sema.makePtrConst(block, alloc);
+    }
+
+    if (try sema.typeRequiresComptime(elem_ty)) {
+        // The value was initialized through RLS, so we didn't detect the runtime condition earlier.
+        // TODO: source location of runtime control flow
+        const init_src: LazySrcLoc = .{ .node_offset_bin_rhs = inst_data.src_node };
+        return sema.fail(block, init_src, "value with comptime-only type '{}' depends on runtime control flow", .{elem_ty.fmt(mod)});
     }
 
     return sema.makePtrConst(block, alloc);
@@ -5188,6 +5181,43 @@ fn zirValidateDeref(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
             break :msg msg;
         };
         return sema.failWithOwnedErrorMsg(block, msg);
+    }
+}
+
+fn zirValidateDestructure(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+    const mod = sema.mod;
+    const inst_data = sema.code.instructions.items(.data)[inst].pl_node;
+    const extra = sema.code.extraData(Zir.Inst.ValidateDestructure, inst_data.payload_index).data;
+    const src = inst_data.src();
+    const destructure_src = LazySrcLoc.nodeOffset(extra.destructure_node);
+    const operand = try sema.resolveInst(extra.operand);
+    const operand_ty = sema.typeOf(operand);
+
+    const can_destructure = switch (operand_ty.zigTypeTag(mod)) {
+        .Array => true,
+        .Struct => operand_ty.isTuple(mod),
+        else => false,
+    };
+
+    if (!can_destructure) {
+        return sema.failWithOwnedErrorMsg(block, msg: {
+            const msg = try sema.errMsg(block, src, "type '{}' cannot be destructured", .{operand_ty.fmt(mod)});
+            errdefer msg.destroy(sema.gpa);
+            try sema.errNote(block, destructure_src, msg, "result destructured here", .{});
+            break :msg msg;
+        });
+    }
+
+    if (operand_ty.arrayLen(mod) != extra.expect_len) {
+        return sema.failWithOwnedErrorMsg(block, msg: {
+            const msg = try sema.errMsg(block, src, "expected {} elements for destructure, found {}", .{
+                extra.expect_len,
+                operand_ty.arrayLen(mod),
+            });
+            errdefer msg.destroy(sema.gpa);
+            try sema.errNote(block, destructure_src, msg, "result destructured here", .{});
+            break :msg msg;
+        });
     }
 }
 
@@ -7298,15 +7328,12 @@ fn analyzeCall(
 
         try mod.declareDeclDependencyType(ics.callee().owner_decl_index, module_fn.owner_decl, .function_body);
 
-        var wip_captures = try WipCaptureScope.init(gpa, fn_owner_decl.src_scope);
-        defer wip_captures.deinit();
-
         var child_block: Block = .{
             .parent = null,
             .sema = sema,
             .src_decl = module_fn.owner_decl,
             .namespace = fn_owner_decl.src_namespace,
-            .wip_capture_scope = wip_captures.scope,
+            .wip_capture_scope = try mod.createCaptureScope(fn_owner_decl.src_scope),
             .instructions = .{},
             .label = null,
             .inlining = &inlining,
@@ -7513,8 +7540,6 @@ fn analyzeCall(
 
             break :res2 result;
         };
-
-        try wip_captures.finalize();
 
         break :res res2;
     } else res: {
@@ -7840,15 +7865,12 @@ fn instantiateGenericCall(
     };
     defer child_sema.deinit();
 
-    var wip_captures = try WipCaptureScope.init(gpa, sema.owner_decl.src_scope);
-    defer wip_captures.deinit();
-
     var child_block: Block = .{
         .parent = null,
         .sema = &child_sema,
         .src_decl = generic_owner_func.owner_decl,
         .namespace = namespace_index,
-        .wip_capture_scope = wip_captures.scope,
+        .wip_capture_scope = try mod.createCaptureScope(sema.owner_decl.src_scope),
         .instructions = .{},
         .inlining = null,
         .is_comptime = true,
@@ -7999,8 +8021,6 @@ fn instantiateGenericCall(
     // Make a runtime call to the new function, making sure to omit the comptime args.
     const func_ty = callee.ty.toType();
     const func_ty_info = mod.typeToFunc(func_ty).?;
-
-    try wip_captures.finalize();
 
     // If the call evaluated to a return type that requires comptime, never mind
     // our generic instantiation. Instead we need to perform a comptime call.
@@ -10327,6 +10347,17 @@ fn zirElemValNode(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     return sema.elemVal(block, src, array, elem_index, elem_index_src, true);
 }
 
+fn zirElemValImm(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
+    const tracy = trace(@src());
+    defer tracy.end();
+
+    const mod = sema.mod;
+    const inst_data = sema.code.instructions.items(.data)[inst].elem_val_imm;
+    const array = try sema.resolveInst(inst_data.operand);
+    const elem_index = try mod.intRef(Type.usize, inst_data.idx);
+    return sema.elemVal(block, .unneeded, array, elem_index, .unneeded, false);
+}
+
 fn zirElemPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
     const tracy = trace(@src());
     defer tracy.end();
@@ -11061,17 +11092,17 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
     const special_prong_src: LazySrcLoc = .{ .node_offset_switch_special_prong = src_node_offset };
     const extra = sema.code.extraData(Zir.Inst.SwitchBlock, inst_data.payload_index);
 
-    const raw_operand: struct { val: Air.Inst.Ref, ptr: Air.Inst.Ref } = blk: {
+    const raw_operand_val: Air.Inst.Ref, const raw_operand_ptr: Air.Inst.Ref = blk: {
         const maybe_ptr = try sema.resolveInst(extra.data.operand);
         if (operand_is_ref) {
             const val = try sema.analyzeLoad(block, src, maybe_ptr, operand_src);
-            break :blk .{ .val = val, .ptr = maybe_ptr };
+            break :blk .{ val, maybe_ptr };
         } else {
-            break :blk .{ .val = maybe_ptr, .ptr = undefined };
+            break :blk .{ maybe_ptr, undefined };
         }
     };
 
-    const operand = try sema.switchCond(block, operand_src, raw_operand.val);
+    const operand = try sema.switchCond(block, operand_src, raw_operand_val);
 
     // AstGen guarantees that the instruction immediately preceding
     // switch_block(_ref) is a dbg_stmt
@@ -11129,7 +11160,7 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
         },
     };
 
-    const maybe_union_ty = sema.typeOf(raw_operand.val);
+    const maybe_union_ty = sema.typeOf(raw_operand_val);
     const union_originally = maybe_union_ty.zigTypeTag(mod) == .Union;
 
     // Duplicate checking variables later also used for `inline else`.
@@ -11680,8 +11711,8 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
     const spa: SwitchProngAnalysis = .{
         .sema = sema,
         .parent_block = block,
-        .operand = raw_operand.val,
-        .operand_ptr = raw_operand.ptr,
+        .operand = raw_operand_val,
+        .operand_ptr = raw_operand_ptr,
         .cond = operand,
         .else_error_ty = else_error_ty,
         .switch_block_inst = inst,
@@ -11897,11 +11928,8 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
         const body = sema.code.extra[extra_index..][0..info.body_len];
         extra_index += info.body_len;
 
-        var wip_captures = try WipCaptureScope.init(gpa, child_block.wip_capture_scope);
-        defer wip_captures.deinit();
-
         case_block.instructions.shrinkRetainingCapacity(0);
-        case_block.wip_capture_scope = wip_captures.scope;
+        case_block.wip_capture_scope = try mod.createCaptureScope(child_block.wip_capture_scope);
 
         const item = case_vals.items[scalar_i];
         // `item` is already guaranteed to be constant known.
@@ -11928,8 +11956,6 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
         } else {
             _ = try case_block.addNoOp(.unreach);
         }
-
-        try wip_captures.finalize();
 
         try cases_extra.ensureUnusedCapacity(gpa, 3 + case_block.instructions.items.len);
         cases_extra.appendAssumeCapacity(1); // items_len
@@ -12177,11 +12203,8 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
             var cond_body = try case_block.instructions.toOwnedSlice(gpa);
             defer gpa.free(cond_body);
 
-            var wip_captures = try WipCaptureScope.init(gpa, child_block.wip_capture_scope);
-            defer wip_captures.deinit();
-
             case_block.instructions.shrinkRetainingCapacity(0);
-            case_block.wip_capture_scope = wip_captures.scope;
+            case_block.wip_capture_scope = try mod.createCaptureScope(child_block.wip_capture_scope);
 
             const body = sema.code.extra[extra_index..][0..info.body_len];
             extra_index += info.body_len;
@@ -12199,8 +12222,6 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
                     false,
                 );
             }
-
-            try wip_captures.finalize();
 
             if (is_first) {
                 is_first = false;
@@ -12407,11 +12428,8 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
             }),
         };
 
-        var wip_captures = try WipCaptureScope.init(gpa, child_block.wip_capture_scope);
-        defer wip_captures.deinit();
-
         case_block.instructions.shrinkRetainingCapacity(0);
-        case_block.wip_capture_scope = wip_captures.scope;
+        case_block.wip_capture_scope = try mod.createCaptureScope(child_block.wip_capture_scope);
 
         if (mod.backendSupportsFeature(.is_named_enum_value) and special.body.len != 0 and block.wantSafety() and
             operand_ty.zigTypeTag(mod) == .Enum and (!operand_ty.isNonexhaustiveEnum(mod) or union_originally))
@@ -12455,8 +12473,6 @@ fn zirSwitchBlock(sema: *Sema, block: *Block, inst: Zir.Inst.Index, operand_is_r
                 _ = try case_block.addNoOp(.unreach);
             }
         }
-
-        try wip_captures.finalize();
 
         if (is_first) {
             final_else_body = case_block.instructions.items;
@@ -15484,11 +15500,7 @@ fn analyzeArithmetic(
 
     const maybe_lhs_val = try sema.resolveMaybeUndefValIntable(casted_lhs);
     const maybe_rhs_val = try sema.resolveMaybeUndefValIntable(casted_rhs);
-    const rs: struct {
-        src: LazySrcLoc,
-        air_tag: Air.Inst.Tag,
-        air_tag_safe: Air.Inst.Tag,
-    } = rs: {
+    const runtime_src: LazySrcLoc, const air_tag: Air.Inst.Tag, const air_tag_safe: Air.Inst.Tag = rs: {
         switch (zir_tag) {
             .add, .add_unsafe => {
                 // For integers:intAddSat
@@ -15535,8 +15547,8 @@ fn analyzeArithmetic(
                         } else {
                             return Air.internedToRef((try Value.floatAdd(lhs_val, rhs_val, resolved_type, sema.arena, mod)).toIntern());
                         }
-                    } else break :rs .{ .src = rhs_src, .air_tag = air_tag, .air_tag_safe = .add_safe };
-                } else break :rs .{ .src = lhs_src, .air_tag = air_tag, .air_tag_safe = .add_safe };
+                    } else break :rs .{ rhs_src, air_tag, .add_safe };
+                } else break :rs .{ lhs_src, air_tag, .add_safe };
             },
             .addwrap => {
                 // Integers only; floats are checked above.
@@ -15556,8 +15568,8 @@ fn analyzeArithmetic(
                     }
                     if (maybe_lhs_val) |lhs_val| {
                         return Air.internedToRef((try sema.numberAddWrapScalar(lhs_val, rhs_val, resolved_type)).toIntern());
-                    } else break :rs .{ .src = lhs_src, .air_tag = .add_wrap, .air_tag_safe = .add_wrap };
-                } else break :rs .{ .src = rhs_src, .air_tag = .add_wrap, .air_tag_safe = .add_wrap };
+                    } else break :rs .{ lhs_src, .add_wrap, .add_wrap };
+                } else break :rs .{ rhs_src, .add_wrap, .add_wrap };
             },
             .add_sat => {
                 // Integers only; floats are checked above.
@@ -15583,14 +15595,14 @@ fn analyzeArithmetic(
 
                         return Air.internedToRef(val.toIntern());
                     } else break :rs .{
-                        .src = lhs_src,
-                        .air_tag = .add_sat,
-                        .air_tag_safe = .add_sat,
+                        lhs_src,
+                        .add_sat,
+                        .add_sat,
                     };
                 } else break :rs .{
-                    .src = rhs_src,
-                    .air_tag = .add_sat,
-                    .air_tag_safe = .add_sat,
+                    rhs_src,
+                    .add_sat,
+                    .add_sat,
                 };
             },
             .sub => {
@@ -15633,8 +15645,8 @@ fn analyzeArithmetic(
                         } else {
                             return Air.internedToRef((try Value.floatSub(lhs_val, rhs_val, resolved_type, sema.arena, mod)).toIntern());
                         }
-                    } else break :rs .{ .src = rhs_src, .air_tag = air_tag, .air_tag_safe = .sub_safe };
-                } else break :rs .{ .src = lhs_src, .air_tag = air_tag, .air_tag_safe = .sub_safe };
+                    } else break :rs .{ rhs_src, air_tag, .sub_safe };
+                } else break :rs .{ lhs_src, air_tag, .sub_safe };
             },
             .subwrap => {
                 // Integers only; floats are checked above.
@@ -15654,8 +15666,8 @@ fn analyzeArithmetic(
                     }
                     if (maybe_rhs_val) |rhs_val| {
                         return Air.internedToRef((try sema.numberSubWrapScalar(lhs_val, rhs_val, resolved_type)).toIntern());
-                    } else break :rs .{ .src = rhs_src, .air_tag = .sub_wrap, .air_tag_safe = .sub_wrap };
-                } else break :rs .{ .src = lhs_src, .air_tag = .sub_wrap, .air_tag_safe = .sub_wrap };
+                    } else break :rs .{ rhs_src, .sub_wrap, .sub_wrap };
+                } else break :rs .{ lhs_src, .sub_wrap, .sub_wrap };
             },
             .sub_sat => {
                 // Integers only; floats are checked above.
@@ -15680,8 +15692,8 @@ fn analyzeArithmetic(
                             try lhs_val.intSubSat(rhs_val, resolved_type, sema.arena, mod);
 
                         return Air.internedToRef(val.toIntern());
-                    } else break :rs .{ .src = rhs_src, .air_tag = .sub_sat, .air_tag_safe = .sub_sat };
-                } else break :rs .{ .src = lhs_src, .air_tag = .sub_sat, .air_tag_safe = .sub_sat };
+                    } else break :rs .{ rhs_src, .sub_sat, .sub_sat };
+                } else break :rs .{ lhs_src, .sub_sat, .sub_sat };
             },
             .mul => {
                 // For integers:
@@ -15773,8 +15785,8 @@ fn analyzeArithmetic(
                         } else {
                             return Air.internedToRef((try lhs_val.floatMul(rhs_val, resolved_type, sema.arena, mod)).toIntern());
                         }
-                    } else break :rs .{ .src = lhs_src, .air_tag = air_tag, .air_tag_safe = .mul_safe };
-                } else break :rs .{ .src = rhs_src, .air_tag = air_tag, .air_tag_safe = .mul_safe };
+                    } else break :rs .{ lhs_src, air_tag, .mul_safe };
+                } else break :rs .{ rhs_src, air_tag, .mul_safe };
             },
             .mulwrap => {
                 // Integers only; floats are handled above.
@@ -15818,8 +15830,8 @@ fn analyzeArithmetic(
                             return mod.undefRef(resolved_type);
                         }
                         return Air.internedToRef((try lhs_val.numberMulWrap(rhs_val, resolved_type, sema.arena, mod)).toIntern());
-                    } else break :rs .{ .src = lhs_src, .air_tag = .mul_wrap, .air_tag_safe = .mul_wrap };
-                } else break :rs .{ .src = rhs_src, .air_tag = .mul_wrap, .air_tag_safe = .mul_wrap };
+                    } else break :rs .{ lhs_src, .mul_wrap, .mul_wrap };
+                } else break :rs .{ rhs_src, .mul_wrap, .mul_wrap };
             },
             .mul_sat => {
                 // Integers only; floats are checked above.
@@ -15869,20 +15881,20 @@ fn analyzeArithmetic(
                             try lhs_val.intMulSat(rhs_val, resolved_type, sema.arena, mod);
 
                         return Air.internedToRef(val.toIntern());
-                    } else break :rs .{ .src = lhs_src, .air_tag = .mul_sat, .air_tag_safe = .mul_sat };
-                } else break :rs .{ .src = rhs_src, .air_tag = .mul_sat, .air_tag_safe = .mul_sat };
+                    } else break :rs .{ lhs_src, .mul_sat, .mul_sat };
+                } else break :rs .{ rhs_src, .mul_sat, .mul_sat };
             },
             else => unreachable,
         }
     };
 
-    try sema.requireRuntimeBlock(block, src, rs.src);
+    try sema.requireRuntimeBlock(block, src, runtime_src);
     if (block.wantSafety() and want_safety and scalar_tag == .Int) {
         if (mod.backendSupportsFeature(.safety_checked_instructions)) {
             _ = try sema.preparePanicId(block, .integer_overflow);
-            return block.addBinOp(rs.air_tag_safe, casted_lhs, casted_rhs);
+            return block.addBinOp(air_tag_safe, casted_lhs, casted_rhs);
         } else {
-            const maybe_op_ov: ?Air.Inst.Tag = switch (rs.air_tag) {
+            const maybe_op_ov: ?Air.Inst.Tag = switch (air_tag) {
                 .add => .add_with_overflow,
                 .sub => .sub_with_overflow,
                 .mul => .mul_with_overflow,
@@ -15919,7 +15931,7 @@ fn analyzeArithmetic(
             }
         }
     }
-    return block.addBinOp(rs.air_tag, casted_lhs, casted_rhs);
+    return block.addBinOp(air_tag, casted_lhs, casted_rhs);
 }
 
 fn analyzePtrArithmetic(
@@ -16557,51 +16569,53 @@ fn zirThis(
 }
 
 fn zirClosureCapture(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
+    const mod = sema.mod;
+    const gpa = sema.gpa;
     const inst_data = sema.code.instructions.items(.data)[inst].un_tok;
     // Closures are not necessarily constant values. For example, the
     // code might do something like this:
     // fn foo(x: anytype) void { const S = struct {field: @TypeOf(x)}; }
     // ...in which case the closure_capture instruction has access to a runtime
-    // value only. In such case we preserve the type and use a dummy runtime value.
+    // value only. In such case only the type is saved into the scope.
     const operand = try sema.resolveInst(inst_data.operand);
     const ty = sema.typeOf(operand);
-    const capture: CaptureScope.Capture = blk: {
-        if (try sema.resolveMaybeUndefValAllowVariables(operand)) |val| {
-            const ip_index = try val.intern(ty, sema.mod);
-            break :blk .{ .comptime_val = ip_index };
-        }
-        break :blk .{ .runtime_val = ty.toIntern() };
+    const key: CaptureScope.Key = .{
+        .zir_index = inst,
+        .index = block.wip_capture_scope,
     };
-    try block.wip_capture_scope.captures.putNoClobber(sema.gpa, inst, capture);
+    if (try sema.resolveMaybeUndefValAllowVariables(operand)) |val| {
+        try mod.comptime_capture_scopes.put(gpa, key, try val.intern(ty, mod));
+    } else {
+        try mod.runtime_capture_scopes.put(gpa, key, ty.toIntern());
+    }
 }
 
 fn zirClosureGet(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
     const mod = sema.mod;
-    const ip = &mod.intern_pool;
+    //const ip = &mod.intern_pool;
     const inst_data = sema.code.instructions.items(.data)[inst].inst_node;
-    var scope: *CaptureScope = mod.declPtr(block.src_decl).src_scope.?;
+    var scope: CaptureScope.Index = mod.declPtr(block.src_decl).src_scope;
+    assert(scope != .none);
     // Note: The target closure must be in this scope list.
     // If it's not here, the zir is invalid, or the list is broken.
-    const capture = while (true) {
+    const capture_ty = while (true) {
         // Note: We don't need to add a dependency here, because
         // decls always depend on their lexical parents.
-
-        // Fail this decl if a scope it depended on failed.
-        if (scope.failed()) {
-            if (sema.owner_func_index != .none) {
-                ip.funcAnalysis(sema.owner_func_index).state = .dependency_failure;
-            } else {
-                sema.owner_decl.analysis = .dependency_failure;
-            }
-            return error.AnalysisFail;
-        }
-        if (scope.captures.get(inst_data.inst)) |capture| {
-            break capture;
-        }
-        scope = scope.parent.?;
+        const key: CaptureScope.Key = .{
+            .zir_index = inst_data.inst,
+            .index = scope,
+        };
+        if (mod.comptime_capture_scopes.get(key)) |val|
+            return Air.internedToRef(val);
+        if (mod.runtime_capture_scopes.get(key)) |ty|
+            break ty;
+        scope = scope.parent(mod);
+        assert(scope != .none);
     };
 
-    if (capture == .runtime_val and !block.is_typeof and sema.func_index == .none) {
+    // The comptime case is handled already above. Runtime case below.
+
+    if (!block.is_typeof and sema.func_index == .none) {
         const msg = msg: {
             const name = name: {
                 const file = sema.owner_decl.getFileScope(mod);
@@ -16629,7 +16643,7 @@ fn zirClosureGet(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         return sema.failWithOwnedErrorMsg(block, msg);
     }
 
-    if (capture == .runtime_val and !block.is_typeof and !block.is_comptime and sema.func_index != .none) {
+    if (!block.is_typeof and !block.is_comptime and sema.func_index != .none) {
         const msg = msg: {
             const name = name: {
                 const file = sema.owner_decl.getFileScope(mod);
@@ -16659,16 +16673,9 @@ fn zirClosureGet(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!
         return sema.failWithOwnedErrorMsg(block, msg);
     }
 
-    switch (capture) {
-        .runtime_val => |ty_ip_index| {
-            assert(block.is_typeof);
-            // We need a dummy runtime instruction with the correct type.
-            return block.addTy(.alloc, ty_ip_index.toType());
-        },
-        .comptime_val => |val_ip_index| {
-            return Air.internedToRef(val_ip_index);
-        },
-    }
+    assert(block.is_typeof);
+    // We need a dummy runtime instruction with the correct type.
+    return block.addTy(.alloc, capture_ty.toType());
 }
 
 fn zirRetAddr(
@@ -24988,7 +24995,7 @@ fn zirBuiltinExtern(
 
     // TODO check duplicate extern
 
-    const new_decl_index = try mod.allocateNewDecl(sema.owner_decl.src_namespace, sema.owner_decl.src_node, null);
+    const new_decl_index = try mod.allocateNewDecl(sema.owner_decl.src_namespace, sema.owner_decl.src_node, .none);
     errdefer mod.destroyDecl(new_decl_index);
     const new_decl = mod.declPtr(new_decl_index);
     new_decl.name = options.name;
@@ -32334,16 +32341,10 @@ fn compareIntsOnlyPossibleResult(
 
     // For any other comparison, we need to know if the LHS value is
     // equal to the maximum or minimum possible value of the RHS type.
-    const edge: struct { min: bool, max: bool } = edge: {
-        if (is_zero and rhs_info.signedness == .unsigned) break :edge .{
-            .min = true,
-            .max = false,
-        };
+    const is_min, const is_max = edge: {
+        if (is_zero and rhs_info.signedness == .unsigned) break :edge .{ true, false };
 
-        if (req_bits != rhs_info.bits) break :edge .{
-            .min = false,
-            .max = false,
-        };
+        if (req_bits != rhs_info.bits) break :edge .{ false, false };
 
         const ty = try mod.intType(
             if (is_negative) .signed else .unsigned,
@@ -32352,24 +32353,18 @@ fn compareIntsOnlyPossibleResult(
         const pop_count = lhs_val.popCount(ty, mod);
 
         if (is_negative) {
-            break :edge .{
-                .min = pop_count == 1,
-                .max = false,
-            };
+            break :edge .{ pop_count == 1, false };
         } else {
-            break :edge .{
-                .min = false,
-                .max = pop_count == req_bits - sign_adj,
-            };
+            break :edge .{ false, pop_count == req_bits - sign_adj };
         }
     };
 
     assert(fits);
     return switch (op) {
-        .lt => if (edge.max) false else null,
-        .lte => if (edge.min) true else null,
-        .gt => if (edge.min) false else null,
-        .gte => if (edge.max) true else null,
+        .lt => if (is_max) false else null,
+        .lte => if (is_min) true else null,
+        .gt => if (is_min) false else null,
+        .gte => if (is_max) true else null,
         .eq, .neq => unreachable,
     };
 }
@@ -32606,7 +32601,7 @@ const PeerResolveStrategy = enum {
             either,
         };
 
-        const res: struct { ReasonMethod, PeerResolveStrategy } = switch (s0) {
+        const reason_method: ReasonMethod, const strat: PeerResolveStrategy = switch (s0) {
             .unknown => .{ .all_s1, s1 },
             .error_set => switch (s1) {
                 .error_set => .{ .either, .error_set },
@@ -32674,7 +32669,7 @@ const PeerResolveStrategy = enum {
             .exact => .{ .all_s0, .exact },
         };
 
-        switch (res[0]) {
+        switch (reason_method) {
             .all_s0 => {
                 if (!s0_is_a) {
                     reason_peer.* = b_peer_idx;
@@ -32691,7 +32686,7 @@ const PeerResolveStrategy = enum {
             },
         }
 
-        return res[1];
+        return strat;
     }
 
     fn select(ty: Type, mod: *Module) PeerResolveStrategy {
@@ -34327,15 +34322,12 @@ fn semaBackingIntType(mod: *Module, struct_obj: *Module.Struct) CompileError!voi
         };
         defer sema.deinit();
 
-        var wip_captures = try WipCaptureScope.init(gpa, decl.src_scope);
-        defer wip_captures.deinit();
-
         var block: Block = .{
             .parent = null,
             .sema = &sema,
             .src_decl = decl_index,
             .namespace = struct_obj.namespace,
-            .wip_capture_scope = wip_captures.scope,
+            .wip_capture_scope = try mod.createCaptureScope(decl.src_scope),
             .instructions = .{},
             .inlining = null,
             .is_comptime = true,
@@ -34356,7 +34348,6 @@ fn semaBackingIntType(mod: *Module, struct_obj: *Module.Struct) CompileError!voi
 
         try sema.checkBackingIntType(&block, backing_int_src, backing_int_ty, fields_bit_sum);
         struct_obj.backing_int_ty = backing_int_ty;
-        try wip_captures.finalize();
         for (comptime_mutable_decls.items) |ct_decl_index| {
             const ct_decl = mod.declPtr(ct_decl_index);
             _ = try ct_decl.internValue(mod);
@@ -35018,15 +35009,12 @@ fn semaStructFields(mod: *Module, struct_obj: *Module.Struct) CompileError!void 
     };
     defer sema.deinit();
 
-    var wip_captures = try WipCaptureScope.init(gpa, decl.src_scope);
-    defer wip_captures.deinit();
-
     var block_scope: Block = .{
         .parent = null,
         .sema = &sema,
         .src_decl = decl_index,
         .namespace = struct_obj.namespace,
-        .wip_capture_scope = wip_captures.scope,
+        .wip_capture_scope = try mod.createCaptureScope(decl.src_scope),
         .instructions = .{},
         .inlining = null,
         .is_comptime = true,
@@ -35283,7 +35271,6 @@ fn semaStructFields(mod: *Module, struct_obj: *Module.Struct) CompileError!void 
             }
         }
     }
-    try wip_captures.finalize();
     for (comptime_mutable_decls.items) |ct_decl_index| {
         const ct_decl = mod.declPtr(ct_decl_index);
         _ = try ct_decl.internValue(mod);
@@ -35361,15 +35348,12 @@ fn semaUnionFields(mod: *Module, arena: Allocator, union_type: InternPool.Key.Un
     };
     defer sema.deinit();
 
-    var wip_captures = try WipCaptureScope.init(gpa, decl.src_scope);
-    defer wip_captures.deinit();
-
     var block_scope: Block = .{
         .parent = null,
         .sema = &sema,
         .src_decl = decl_index,
         .namespace = union_type.namespace,
-        .wip_capture_scope = wip_captures.scope,
+        .wip_capture_scope = try mod.createCaptureScope(decl.src_scope),
         .instructions = .{},
         .inlining = null,
         .is_comptime = true,
@@ -35380,7 +35364,6 @@ fn semaUnionFields(mod: *Module, arena: Allocator, union_type: InternPool.Key.Un
         try sema.analyzeBody(&block_scope, body);
     }
 
-    try wip_captures.finalize();
     for (comptime_mutable_decls.items) |ct_decl_index| {
         const ct_decl = mod.declPtr(ct_decl_index);
         _ = try ct_decl.internValue(mod);
@@ -35823,18 +35806,16 @@ fn generateUnionTagTypeSimple(
 }
 
 fn getBuiltin(sema: *Sema, name: []const u8) CompileError!Air.Inst.Ref {
+    const mod = sema.mod;
     const gpa = sema.gpa;
     const src = LazySrcLoc.nodeOffset(0);
-
-    var wip_captures = try WipCaptureScope.init(gpa, sema.owner_decl.src_scope);
-    defer wip_captures.deinit();
 
     var block: Block = .{
         .parent = null,
         .sema = sema,
         .src_decl = sema.owner_decl_index,
         .namespace = sema.owner_decl.src_namespace,
-        .wip_capture_scope = wip_captures.scope,
+        .wip_capture_scope = try mod.createCaptureScope(sema.owner_decl.src_scope),
         .instructions = .{},
         .inlining = null,
         .is_comptime = true,
@@ -35875,17 +35856,15 @@ fn getBuiltinDecl(sema: *Sema, block: *Block, name: []const u8) CompileError!Mod
 }
 
 fn getBuiltinType(sema: *Sema, name: []const u8) CompileError!Type {
+    const mod = sema.mod;
     const ty_inst = try sema.getBuiltin(name);
-
-    var wip_captures = try WipCaptureScope.init(sema.gpa, sema.owner_decl.src_scope);
-    defer wip_captures.deinit();
 
     var block: Block = .{
         .parent = null,
         .sema = sema,
         .src_decl = sema.owner_decl_index,
         .namespace = sema.owner_decl.src_namespace,
-        .wip_capture_scope = wip_captures.scope,
+        .wip_capture_scope = try mod.createCaptureScope(sema.owner_decl.src_scope),
         .instructions = .{},
         .inlining = null,
         .is_comptime = true,
@@ -36527,7 +36506,7 @@ pub fn typeRequiresComptime(sema: *Sema, ty: Type) CompileError!bool {
             .ptr_type => |ptr_type| {
                 const child_ty = ptr_type.child.toType();
                 switch (child_ty.zigTypeTag(mod)) {
-                    .Fn => return mod.typeToFunc(child_ty).?.is_generic,
+                    .Fn => return !try sema.fnHasRuntimeBits(child_ty),
                     .Opaque => return false,
                     else => return sema.typeRequiresComptime(child_ty),
                 }
