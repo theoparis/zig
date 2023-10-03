@@ -56,7 +56,7 @@ pub const sched_yield = __libc_thr_yield;
 
 pub extern "c" fn posix_memalign(memptr: *?*anyopaque, alignment: usize, size: usize) c_int;
 
-pub extern "c" fn __msync13(addr: *align(std.mem.page_size) const anyopaque, len: usize, flags: c_int) c_int;
+pub extern "c" fn __msync13(addr: *const anyopaque, len: usize, flags: c_int) c_int;
 pub const msync = __msync13;
 
 const pthread_spin_t = switch (builtin.cpu.arch) {

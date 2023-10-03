@@ -1323,8 +1323,8 @@ pub const SubmissionQueue = struct {
     dropped: *u32,
     array: []u32,
     sqes: []linux.io_uring_sqe,
-    mmap: []align(mem.page_size) u8,
-    mmap_sqes: []align(mem.page_size) u8,
+    mmap: []u8,
+    mmap_sqes: []u8,
 
     // We use `sqe_head` and `sqe_tail` in the same way as liburing:
     // We increment `sqe_tail` (but not `tail`) for each call to `get_sqe()`.

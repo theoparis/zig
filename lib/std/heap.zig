@@ -29,7 +29,7 @@ pub const MemoryPoolExtra = memory_pool.MemoryPoolExtra;
 pub const MemoryPoolOptions = memory_pool.Options;
 
 /// TODO Utilize this on Windows.
-pub var next_mmap_addr_hint: ?[*]align(mem.page_size) u8 = null;
+pub var next_mmap_addr_hint: ?[*]u8 = null;
 
 const CAllocator = struct {
     comptime {
@@ -245,7 +245,7 @@ pub const wasm_allocator = Allocator{
 /// Verifies that the adjusted length will still map to the full length
 pub fn alignPageAllocLen(full_len: usize, len: usize) usize {
     const aligned_len = mem.alignAllocLen(full_len, len);
-    assert(mem.alignForward(usize, aligned_len, mem.page_size) == full_len);
+    assert(mem.alignForward(usize, aligned_len, std.heap.pageSize()) == full_len);
     return aligned_len;
 }
 
@@ -581,6 +581,33 @@ pub fn StackFallbackAllocator(comptime size: usize) type {
     };
 }
 
+var page_size: ?usize = null;
+
+pub fn pageSize() usize {
+    if (builtin.cpu.arch.isWasm()) {
+        return 64 * 1024;
+    }
+
+    if (page_size) |pg_size| return pg_size;
+
+    page_size = switch (builtin.os.tag) {
+        .linux => if (builtin.link_libc) @intCast(std.c.sysconf(std.os.linux.SC.PAGESIZE)) else std.os.linux.getauxval(std.elf.AT_PAGESZ),
+        .macos => std.os.darwin.machTaskForSelf().getPageSize() catch 0,
+        .windows => blk: {
+            var info: std.os.windows.SYSTEM_INFO = undefined;
+            std.os.windows.kernel32.GetSystemInfo(&info);
+            break :blk info.dwPageSize;
+        },
+        else => if (builtin.link_libc and @hasDecl(std.c, "getpagesize")) @intCast(std.c.getpagesize()) else switch (builtin.cpu.arch) {
+            .sparc64 => 8 * 1024,
+            else => 4 * 1024,
+        },
+    };
+
+    assert(page_size.? > 0 and page_size.? % 2 == 0);
+    return page_size.?;
+}
+
 test "c_allocator" {
     if (builtin.link_libc) {
         try testAllocator(c_allocator);
@@ -606,13 +633,13 @@ test "PageAllocator" {
     }
 
     if (builtin.os.tag == .windows) {
-        const slice = try allocator.alignedAlloc(u8, mem.page_size, 128);
+        const slice = try allocator.alignedAlloc(u8, 1, 128);
         slice[0] = 0x12;
         slice[127] = 0x34;
         allocator.free(slice);
     }
     {
-        var buf = try allocator.alloc(u8, mem.page_size + 1);
+        var buf = try allocator.alloc(u8, pageSize() + 1);
         defer allocator.free(buf);
         buf = try allocator.realloc(buf, 1); // shrink past the page boundary
     }
@@ -815,12 +842,12 @@ pub fn testAllocatorLargeAlignment(base_allocator: mem.Allocator) !void {
     var validationAllocator = mem.validationWrap(base_allocator);
     const allocator = validationAllocator.allocator();
 
-    const large_align: usize = mem.page_size / 2;
+    const large_align: usize = pageSize() / 2;
 
     var align_mask: usize = undefined;
-    align_mask = @shlWithOverflow(~@as(usize, 0), @as(Allocator.Log2Align, @ctz(large_align)))[0];
+    align_mask = @shlWithOverflow(~@as(usize, 0), @as(Allocator.Log2Align, @ctz(@as(u7, @truncate(large_align)))))[0];
 
-    var slice = try allocator.alignedAlloc(u8, large_align, 500);
+    var slice = try allocator.alignedAlloc(u8, 512, 500);
     try testing.expect(@intFromPtr(slice.ptr) & align_mask == @intFromPtr(slice.ptr));
 
     if (allocator.resize(slice, 100)) {
@@ -848,7 +875,7 @@ pub fn testAllocatorAlignedShrink(base_allocator: mem.Allocator) !void {
     var fib = FixedBufferAllocator.init(&debug_buffer);
     const debug_allocator = fib.allocator();
 
-    const alloc_size = mem.page_size * 2 + 50;
+    const alloc_size = pageSize() * 2 + 50;
     var slice = try allocator.alignedAlloc(u8, 16, alloc_size);
     defer allocator.free(slice);
 
@@ -857,7 +884,7 @@ pub fn testAllocatorAlignedShrink(base_allocator: mem.Allocator) !void {
     // which is 16 pages, hence the 32. This test may require to increase
     // the size of the allocations feeding the `allocator` parameter if they
     // fail, because of this high over-alignment we want to have.
-    while (@intFromPtr(slice.ptr) == mem.alignForward(usize, @intFromPtr(slice.ptr), mem.page_size * 32)) {
+    while (@intFromPtr(slice.ptr) == mem.alignForward(usize, @intFromPtr(slice.ptr), pageSize() * 32)) {
         try stuff_to_free.append(slice);
         slice = try allocator.alignedAlloc(u8, 16, alloc_size);
     }

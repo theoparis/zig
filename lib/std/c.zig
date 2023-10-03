@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @This();
-const page_size = std.mem.page_size;
 const iovec = std.os.iovec;
 const iovec_const = std.os.iovec_const;
 const wasi = @import("c/wasi.zig");
@@ -701,6 +700,7 @@ pub usingnamespace switch (native_os) {
         pub extern "c" fn getrusage(who: c_int, usage: *c.rusage) c_int;
 
         pub extern "c" fn sched_yield() c_int;
+        pub extern "c" fn sysconf(sc: c_int) c_long;
 
         pub extern "c" fn sigaction(sig: c_int, noalias act: ?*const c.Sigaction, noalias oact: ?*c.Sigaction) c_int;
         pub extern "c" fn sigprocmask(how: c_int, noalias set: ?*const c.sigset_t, noalias oset: ?*c.sigset_t) c_int;
@@ -713,7 +713,7 @@ pub usingnamespace switch (native_os) {
 
         pub extern "c" fn alarm(seconds: c_uint) c_uint;
 
-        pub extern "c" fn msync(addr: *align(page_size) const anyopaque, len: usize, flags: c_int) c_int;
+        pub extern "c" fn msync(addr: *const anyopaque, len: usize, flags: c_int) c_int;
     },
 };
 
@@ -782,9 +782,9 @@ pub extern "c" fn writev(fd: c_int, iov: [*]const iovec_const, iovcnt: c_uint) i
 pub extern "c" fn pwritev(fd: c_int, iov: [*]const iovec_const, iovcnt: c_uint, offset: c.off_t) isize;
 pub extern "c" fn write(fd: c.fd_t, buf: [*]const u8, nbyte: usize) isize;
 pub extern "c" fn pwrite(fd: c.fd_t, buf: [*]const u8, nbyte: usize, offset: c.off_t) isize;
-pub extern "c" fn mmap(addr: ?*align(page_size) anyopaque, len: usize, prot: c_uint, flags: MAP, fd: c.fd_t, offset: c.off_t) *anyopaque;
-pub extern "c" fn munmap(addr: *align(page_size) const anyopaque, len: usize) c_int;
-pub extern "c" fn mprotect(addr: *align(page_size) anyopaque, len: usize, prot: c_uint) c_int;
+pub extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_uint, flags: MAP, fd: c.fd_t, offset: c.off_t) *anyopaque;
+pub extern "c" fn munmap(addr: *const anyopaque, len: usize) c_int;
+pub extern "c" fn mprotect(addr: *anyopaque, len: usize, prot: c_uint) c_int;
 pub extern "c" fn link(oldpath: [*:0]const u8, newpath: [*:0]const u8, flags: c_int) c_int;
 pub extern "c" fn linkat(oldfd: c.fd_t, oldpath: [*:0]const u8, newfd: c.fd_t, newpath: [*:0]const u8, flags: c_int) c_int;
 pub extern "c" fn unlink(path: [*:0]const u8) c_int;
