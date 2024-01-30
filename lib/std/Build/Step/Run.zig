@@ -123,6 +123,19 @@ pub const Arg = union(enum) {
     directory_source: PrefixedLazyPath,
     bytes: []u8,
     output: *Output,
+
+    pub fn format(self: *const Arg, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+
+        return switch (self.*) {
+            .artifact => |artifact| writer.print("{}", .{artifact.getEmittedBin()}),
+            .lazy_path => |lazy_path| writer.print("{}", .{lazy_path}),
+            .directory_source => |directory_source| writer.print("{}", .{directory_source}),
+            .bytes => |bytes| writer.writeAll(bytes),
+            .output => |output| writer.print("{}", .{output}),
+        };
+    }
 };
 
 pub const PrefixedLazyPath = struct {
@@ -144,6 +157,7 @@ pub fn create(owner: *std.Build, name: []const u8) *Run {
             .name = name,
             .owner = owner,
             .makeFn = make,
+            .formatFn = format,
         }),
         .argv = ArrayList(Arg).init(owner.allocator),
         .cwd = null,
@@ -628,6 +642,24 @@ fn make(step: *Step, prog_node: *std.Progress.Node) !void {
         b.cache_root,
         &digest,
     );
+}
+
+fn format(step: *const Step) std.os.WriteError![]const u8 {
+    const b = step.owner;
+    const arena = b.allocator;
+    const self = @fieldParentPtr(Run, "step", step);
+
+    var output = ArrayList(u8).init(arena);
+    errdefer output.deinit();
+
+    output.writer().writeAll("Command:") catch @panic("OOM");
+
+    for (self.argv.items) |item| {
+        output.writer().writeByte(' ') catch @panic("OOM");
+        std.fmt.formatType(item, "", .{}, output.writer(), 1) catch @panic("OOM");
+    }
+
+    return output.toOwnedSlice() catch @panic("OOM");
 }
 
 fn populateGeneratedPaths(

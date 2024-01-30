@@ -2,6 +2,7 @@ id: Id,
 name: []const u8,
 owner: *Build,
 makeFn: MakeFn,
+formatFn: ?FormatFn,
 
 dependencies: std.ArrayList(*Step),
 /// This field is empty during execution of the user's build script, and
@@ -59,6 +60,7 @@ pub const TestResults = struct {
 };
 
 pub const MakeFn = *const fn (self: *Step, prog_node: *std.Progress.Node) anyerror!void;
+pub const FormatFn = *const fn (self: *const Step) anyerror![]const u8;
 
 pub const State = enum {
     precheck_unstarted,
@@ -136,6 +138,7 @@ pub const StepOptions = struct {
     name: []const u8,
     owner: *Build,
     makeFn: MakeFn = makeNoOp,
+    formatFn: ?FormatFn = null,
     first_ret_addr: ?usize = null,
     max_rss: usize = 0,
 };
@@ -148,6 +151,7 @@ pub fn init(options: StepOptions) Step {
         .name = arena.dupe(u8, options.name) catch @panic("OOM"),
         .owner = options.owner,
         .makeFn = options.makeFn,
+        .formatFn = options.formatFn,
         .dependencies = std.ArrayList(*Step).init(arena),
         .dependants = .{},
         .state = .precheck_unstarted,
@@ -554,6 +558,78 @@ pub fn writeManifest(s: *Step, man: *std.Build.Cache.Manifest) !void {
         man.writeManifest() catch |err| {
             try s.addError("unable to write cache manifest: {s}", .{@errorName(err)});
         };
+    }
+}
+
+/// Locates a dependency step by a string split by "/"
+pub fn getDependencyByPath(s: *Step, path: []const u8) ?*Step {
+    const i = std.mem.indexOf(u8, path, "/") orelse path.len;
+    const name = path[0..i];
+
+    for (s.dependencies.items) |dep| {
+        if (std.mem.eql(u8, dep.name, name)) {
+            if (i < path.len) return dep.getDependencyByPath(path[(i + 1)..]);
+            return dep;
+        }
+    }
+    return null;
+}
+
+/// Locates a dependant step by a string split by "/"
+pub fn getDependantByPath(s: *Step, path: []const u8) ?*Step {
+    const i = std.mem.indexOf(u8, path, "/") orelse path.len;
+    const name = path[0..i];
+
+    for (s.dependants.items) |dep| {
+        if (std.mem.eql(u8, dep.name, name)) {
+            if (i < path.len) return dep.getDependantByPath(path[(i + 1)..]);
+            return dep;
+        }
+    }
+    return null;
+}
+
+pub fn format(s: *const Step, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) @TypeOf(writer).Error!void {
+    _ = fmt;
+    _ = options;
+
+    try writer.print(
+        \\Id: {s}
+        \\Name: {s}
+        \\Dependencies:
+    , .{ @tagName(s.id), s.name });
+
+    if (s.dependencies.items.len == 0) {
+        try writer.writeAll(" None\n");
+    } else {
+        try writer.writeByte('\n');
+
+        for (s.dependencies.items) |item| {
+            try writer.print("  - {s}\n", .{ item.name });
+        }
+    }
+
+    try writer.writeAll("Dependants:");
+
+    if (s.dependants.items.len == 0) {
+        try writer.writeAll(" None\n");
+    } else {
+        try writer.writeByte('\n');
+
+        for (s.dependants.items) |item| {
+            try writer.print("  - {s}\n", .{ item.name });
+        }
+    }
+
+    if (s.formatFn) |func| {
+        if (func(s)) |str| {
+            defer s.owner.allocator.free(str);
+
+            try writer.writeAll(str);
+            try writer.writeByte('\n');
+        } else |err| {
+            try writer.writeAll(@errorName(err));
+        }
     }
 }
 

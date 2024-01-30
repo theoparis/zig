@@ -100,6 +100,8 @@ pub fn main() !void {
     var help_menu: bool = false;
     var steps_menu: bool = false;
     var output_tmp_nonce: ?[16]u8 = null;
+    var inspect: bool = false;
+    var inspect_step_path: ?[]const u8 = null;
 
     while (nextArg(args, &arg_idx)) |arg| {
         if (mem.startsWith(u8, arg, "-Z")) {
@@ -211,6 +213,11 @@ pub fn main() !void {
                 graph.system_package_mode = true;
             } else if (mem.eql(u8, arg, "--glibc-runtimes")) {
                 builder.glibc_runtimes_dir = nextArgOrFatal(args, &arg_idx);
+            } else if (mem.startsWith(u8, arg, "--inspect=")) {
+                inspect = true;
+                inspect_step_path = arg["--inspect=".len..];
+            } else if (mem.eql(u8, arg, "--inspect")) {
+                inspect = true;
             } else if (mem.eql(u8, arg, "--verbose-link")) {
                 builder.verbose_link = true;
             } else if (mem.eql(u8, arg, "--verbose-air")) {
@@ -343,6 +350,22 @@ pub fn main() !void {
 
     if (steps_menu)
         return steps(builder, stdout_writer);
+
+    if (inspect) {
+        if (inspect_step_path) |step_path| {
+            const step = builder.lookupStep(step_path) orelse fatalWithHint("Invalid step path {s}", .{step_path});
+
+            try stdout_writer.print("{}", .{step});
+        } else {
+            const tlps = builder.top_level_steps.values();
+            for (tlps, 0..) |tlp, i| {
+                try stdout_writer.print("{}", .{tlp.step});
+                if ((i + 1) < tlps.len) try stdout_writer.writeByte('\n');
+            }
+        }
+
+        std.process.exit(0);
+    }
 
     var run: Run = .{
         .max_rss = max_rss,
@@ -1195,6 +1218,7 @@ fn usage(b: *std.Build, out_stream: anytype) !void {
         \\  --verbose-cimport            Enable compiler debug output for C imports
         \\  --verbose-cc                 Enable compiler debug output for C compilation
         \\  --verbose-llvm-cpu-features  Enable compiler debug output for LLVM CPU features
+        \\  --inspect=[step]             Dump step metadata for a particular step or all steps.
         \\
     );
 }
