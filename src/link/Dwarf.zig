@@ -1045,6 +1045,14 @@ pub fn init(lf: *File, format: Format) Dwarf {
                 .line_range = 14,
                 .opcode_base = DW.LNS.set_isa + 1,
             },
+            .riscv64 => .{
+                .minimum_instruction_length = 1,
+                .maximum_operations_per_instruction = 1,
+                .default_is_stmt = true,
+                .line_base = 0,
+                .line_range = 1,
+                .opcode_base = DW.LNS.set_isa + 1,
+            },
             else => .{
                 .minimum_instruction_length = 1,
                 .maximum_operations_per_instruction = 1,
