@@ -300,6 +300,7 @@ pub fn create(owner: *std.Build, options: Options) *Compile {
             .name = step_name,
             .owner = owner,
             .makeFn = make,
+            .formatFn = format,
             .max_rss = options.max_rss,
         }),
         .version = options.version,
@@ -914,10 +915,10 @@ fn getGeneratedFilePath(self: *Compile, comptime tag_name: []const u8, asking_st
     return path;
 }
 
-fn make(step: *Step, prog_node: *std.Progress.Node) !void {
+fn getZigArguments(self: *Compile) ![]const []const u8 {
+    const step = &self.step;
     const b = step.owner;
     const arena = b.allocator;
-    const self = @fieldParentPtr(Compile, "step", step);
 
     var zig_args = ArrayList([]const u8).init(arena);
     defer zig_args.deinit();
@@ -1648,8 +1649,17 @@ fn make(step: *Step, prog_node: *std.Progress.Node) !void {
         zig_args.shrinkRetainingCapacity(2);
         try zig_args.append(resolved_args_file);
     }
+    return try zig_args.toOwnedSlice();
+}
 
-    const maybe_output_bin_path = step.evalZigProcess(zig_args.items, prog_node) catch |err| switch (err) {
+fn make(step: *Step, prog_node: *std.Progress.Node) !void {
+    const b = step.owner;
+    const self = @fieldParentPtr(Compile, "step", step);
+
+    const zig_args = try self.getZigArguments();
+    defer b.allocator.free(zig_args);
+
+    const maybe_output_bin_path = step.evalZigProcess(zig_args, prog_node) catch |err| switch (err) {
         error.NeedCompileErrorCheck => {
             assert(self.expect_errors != null);
             try checkCompileErrors(self);
@@ -1719,6 +1729,26 @@ fn make(step: *Step, prog_node: *std.Progress.Node) !void {
             self.name_only_filename.?,
         );
     }
+}
+
+fn format(step: *const Step) std.os.WriteError![]const u8 {
+    const b = step.owner;
+    const arena = b.allocator;
+    const self = @fieldParentPtr(Compile, "step", step);
+
+    var output = ArrayList(u8).init(arena);
+    errdefer output.deinit();
+
+    output.writer().writeAll("Command:") catch @panic("OOM");
+
+    const zig_args = @constCast(self).getZigArguments() catch @panic("OOM");
+    defer b.allocator.free(zig_args);
+
+    for (zig_args) |arg| {
+        output.writer().writeByte(' ') catch @panic("OOM");
+        output.writer().writeAll(arg) catch @panic("OOM");
+    }
+    return output.toOwnedSlice() catch @panic("OOM");
 }
 
 pub fn doAtomicSymLinks(

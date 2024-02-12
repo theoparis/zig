@@ -591,6 +591,22 @@ fn determineAndApplyInstallPrefix(b: *Build) !void {
     b.resolveInstallPrefix(install_prefix, .{});
 }
 
+pub fn lookupStep(b: *Build, p: []const u8) ?*Step {
+    const i = std.mem.indexOf(u8, p, "/") orelse p.len;
+    const name = p[0..i];
+
+    if (b.top_level_steps.get(name)) |s| {
+        return if (name.len == p.len) &s.step else s.step.getDependencyByPath(p[(i + 1)..]);
+    }
+    return null;
+}
+
+pub fn destroy(b: *Build) void {
+    b.env_map.deinit();
+    b.top_level_steps.deinit(b.allocator);
+    b.allocator.destroy(b);
+}
+
 /// This function is intended to be called by lib/build_runner.zig, not a build.zig file.
 pub fn resolveInstallPrefix(self: *Build, install_prefix: ?[]const u8, dir_list: DirList) void {
     if (self.dest_dir) |dest_dir| {
