@@ -1137,7 +1137,7 @@ pub const DwarfInfo = struct {
                         .end_addr = self.base_address + end_addr,
                     };
                 },
-                else => unreachable,
+                else => debug.print("Unrecognized section type {s}", .{@tagName(self.section_type)}),
             }
         }
     };
