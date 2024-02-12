@@ -1672,7 +1672,7 @@ pub fn standardDynamicLinkerPath_cpu_os_abi(cpu: Cpu, os_tag: Os.Tag, abi: Abi) 
             }),
 
             .riscv32 => return copy(&result, "/lib/ld-linux-riscv32-ilp32.so.1"),
-            .riscv64 => return copy(&result, "/lib/ld-linux-riscv64-lp64.so.1"),
+            .riscv64 => return copy(&result, "/lib/ld-linux-riscv64-lp64d.so.1"),
 
             // Architectures in this list have been verified as not having a standard
             // dynamic linker path.
