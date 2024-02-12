@@ -619,10 +619,10 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .union_init      => try self.airUnionInit(inst),
             .prefetch        => try self.airPrefetch(inst),
             .mul_add         => try self.airMulAdd(inst),
-            .addrspace_cast  => @panic("TODO"),
+            .addrspace_cast  => return self.fail("TODO implement addrspace_cast", .{}),
 
-            .@"try"          => @panic("TODO"),
-            .try_ptr         => @panic("TODO"),
+            .@"try"          => return self.fail("TODO implement try", .{}),
+            .try_ptr         => return self.fail("TODO implement try_ptr", .{}),
 
             .dbg_var_ptr,
             .dbg_var_val,
