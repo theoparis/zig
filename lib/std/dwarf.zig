@@ -1139,6 +1139,7 @@ pub const DwarfInfo = struct {
                 },
                 else => debug.print("Unrecognized section type {s}", .{@tagName(self.section_type)}),
             }
+            unreachable;
         }
     };
 
